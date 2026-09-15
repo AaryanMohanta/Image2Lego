@@ -12,7 +12,7 @@ greedily merging voxels into actual brick/plate parts, and then repairing
 the result so it's a single physically-connected structure with a
 simplified stability check -- and exposes it as a CLI and a small web UI.
 
-## Pipeline
+## How it works
 
 ```mermaid
 flowchart TD
@@ -33,8 +33,66 @@ flowchart TD
 Each stage's intermediate artefact (`subject.png`, `mesh.glb`, `occ.npz`) is
 saved in the output directory, so any later stage can be re-run from it
 directly (`image2lego voxelize`, `image2lego legolize`, ... -- see
-`image2lego <command> --help`) without repeating the expensive earlier
-steps.
+[Usage](#usage) and `image2lego <command> --help`) without repeating the
+expensive earlier steps. (For the invariants each stage is required to
+preserve -- useful if you're modifying the pipeline rather than just running
+it -- see [CONTRIBUTING.md](CONTRIBUTING.md).)
+
+**1. Image to mesh.** A photo is background-removed, cropped/padded, and
+handed to one of three interchangeable backends
+(`image2lego/frontend/`): `file` (you already have a `.glb`, no photo step
+needed), `hosted` (a hosted image-to-3D API), or `trellis2` (self-hosted
+[TRELLIS.2](https://github.com/microsoft/TRELLIS.2), see `services/trellis2/`).
+If you're starting from an existing mesh rather than a photo, this whole
+stage is skipped.
+
+**2. Orient and scale.** `geometry/mesh.py` picks the mesh's up-axis
+(auto-detected as whichever extent is smallest, or forced with `--up`) and
+scales it so its longer horizontal extent equals `--width` studs, with the
+vertical axis quantized to whole brick or plate layers.
+
+**3. Voxelize.** `geometry/voxelize.py` resamples the mesh onto that
+stud/layer-aligned grid, producing a boolean occupancy array indexed
+`[x, y, z]` (`y` counting up from the ground). `--hollow N` also carves out
+everything more than `N` voxels from the surface, since a solid interior is
+mostly wasted parts; the pre-hollow solid version is kept alongside it
+(`solid_occ`) so later repair steps have interior space to route support
+struts through.
+
+**4. Colorize.** `geometry/colorize.py` samples the *original* mesh's
+surface colour at each occupied voxel (with jittered multi-sample
+averaging) and snaps it to the nearest colour in a real LEGO palette
+(`image2lego/colours.py`, CIELAB nearest-neighbour) -- or to nothing, if no
+`colors.csv` is installed (see [Install](#install)). `--symmetrise x|z`
+mirrors the occupancy grid across that axis first, keeping whichever half
+has more material, to paper over single-view reconstruction asymmetry.
+
+**5. Legolize.** `legolize/` turns the coloured voxel grid into actual
+brick/plate parts (1x1 up to 2x8, `model.py`'s `PartCatalogue`):
+  - `greedy.py` merges each horizontal layer into the fewest/largest bricks
+    it can, scanning from a randomised corner so repeated runs don't all
+    seam in the same place; several random restarts are tried and the
+    best-scoring one is kept.
+  - `graph.py` models the result as a graph (bricks as nodes, an edge
+    between two bricks on adjacent layers wherever their footprints
+    overlap -- LEGO's stud-and-tube connection only works vertically, so
+    that's the only kind of edge that exists) and finds structural weak
+    points from it: articulation points, degree-1 bricks, and seams
+    (a repeated straight joint across 3+ layers).
+  - `repair.py` hill-climbs those weak points -- and, at higher priority,
+    any outright disconnection between components -- by dissolving a small
+    window around the problem and re-merging it, keeping the change only
+    if it helps; anything still floating afterwards gets a vertical filler
+    column down to the ground (through `solid_occ`) or, failing that, is
+    dropped with a warning.
+  - `stability.py` (opt-in; see [Known limitations](#known-limitations))
+    solves a linear-programming relaxation of static equilibrium -- gravity
+    against clutch-power stud connections and ground friction -- and can
+    likewise hill-climb the most-stressed brick.
+
+**6. Output.** The finished brick list is written out as an LDraw model
+(`io/ldraw.py`), a BrickLink Wanted List and parts CSV (`io/bricklink.py`),
+and a fast hand-rolled isometric preview render (`render.py`).
 
 ## Install
 
@@ -77,27 +135,100 @@ image2lego still produces a valid (uncoloured) model, with a warning.
 
 ## Usage
 
+Every command has a full `--help`; this covers the common cases. Sizes
+throughout are in studs (the horizontal grid unit); `--width` is always the
+*longer* of the model's x/z extents, scaled to that many studs.
+
+### `image2lego build` -- the full pipeline, in one command
+
 ```bash
-# Full pipeline from a photo, using a hosted image-to-3D API
+# From a photo, using a hosted image-to-3D API
 image2lego build photo.jpg --backend hosted --width 40 --bricks \
     --hollow 3 --symmetrise x --max-colours 6 --out outdir/
 
-# Full pipeline from a mesh you already have (no image-to-3D step)
+# From a mesh you already have (no image-to-3D step -- photo.jpg is still
+# a required argument, but --mesh's geometry is what actually gets used)
 image2lego build photo.jpg --backend file --mesh existing.glb \
     --width 40 --bricks --out outdir/
+```
 
-# Check any LDraw file's structural stability (yours, or one exported
-# from Studio)
+Writes `model.ldr`, `wanted.xml`, `parts.csv`, `preview.png`, and
+`report.json` into `--out`, alongside the intermediate `subject.png`,
+`mesh.glb`, and `occ.npz`. Key options:
+
+| Flag | Meaning |
+| --- | --- |
+| `--backend file\|hosted\|trellis2` | Image-to-3D source (`file` needs `--mesh`) |
+| `--width N` | Longer horizontal extent, in studs |
+| `--plates` / `--bricks` (default) | Plate height (1/3 as tall) instead of brick height |
+| `--hollow N` (default 3) | Shell thickness in voxels; `0` for a solid interior |
+| `--up auto\|x\|y\|z` | Force the source mesh's up-axis instead of auto-detecting it |
+| `--symmetrise x\|z` | Mirror-symmetrise the voxel grid before colorizing, keeping whichever half has more material -- useful for photographed objects that are approximately symmetric but whose single-view reconstruction wasn't |
+| `--max-colours N` | Cluster surface colours down to at most N before palette-snapping |
+| `--seed N` / `--restarts N` / `--repair-iters N` | Determinism and search-effort knobs for `legolize` (see below) |
+
+### `image2lego check` -- structural stability, on any `.ldr`
+
+```bash
 image2lego check outdir/model.ldr
+image2lego check outdir/model.ldr --t-max 2.0 --s-max 2.0  # stronger studs
+```
 
-# Web UI
+Works on any LDraw file built from this project's own brick/plate parts in
+a uniform brick-or-plate layer type -- your own output, or a compatible
+Studio export -- and prints whether the model is in static equilibrium plus
+its most-stressed bricks. `--t-max`/`--s-max` scale the assumed per-stud
+clutch strength (tension/shear) if the default flags something you're
+confident is actually fine.
+
+### `image2lego serve` -- the web UI
+
+```bash
 image2lego serve --port 8000
 ```
 
-`--symmetrise {x,z}` mirrors the voxel grid across that axis before
-colorizing, keeping whichever half has more material (useful for
-photographed objects that are approximately symmetric but whose
-reconstruction wasn't).
+Opens a single-page UI at `http://127.0.0.1:8000` that wraps the same
+`build` pipeline: pick a backend (uploading a mesh for `file`, or a photo
+for `hosted`/`trellis2`), set width/plates/hollow/symmetrise/max-colours,
+submit, and watch the job's log stream in as it runs, with the same output
+files downloadable when it finishes.
+
+### Working stage-by-stage
+
+`build`/`serve` run the whole pipeline at once, but each stage can also be
+run and re-run independently -- useful for iterating on `legolize` without
+re-voxelizing, or inspecting an intermediate result:
+
+```bash
+# mesh -> occupancy/colour grid
+image2lego voxelize existing.glb --width 40 --bricks --out outdir/occ.npz
+
+# occupancy/colour grid -> LDraw model (+ optional wanted-list XML)
+image2lego legolize outdir/occ.npz --out outdir/model.ldr --xml outdir/wanted.xml
+
+# occupancy/colour grid -> top/front/side views, in the terminal and as a PNG
+image2lego preview outdir/occ.npz
+```
+
+### Using the Python API directly
+
+The CLI doesn't expose every option -- notably, the stability-aware repair
+pass (`legolize(..., stability=True)`) isn't wired up as a `build`/`legolize`
+flag, since it's slower and most useful while iterating on a specific model:
+
+```python
+from image2lego.legolize import legolize
+from image2lego.model import PartCatalogue
+
+bricks = legolize(
+    colours, solid_occ, PartCatalogue(), "brick",
+    seed=0, restarts=4, repair_iters=200,
+    stability=True, stability_iters=50, t_max=1.0, s_max=1.0,
+)
+```
+
+`colours`/`solid_occ` are exactly what `voxelize`/`build` produce (and what's
+saved in `occ.npz`'s `colours`/`solid_occ` arrays).
 
 ## Opening the result in BrickLink Studio
 
