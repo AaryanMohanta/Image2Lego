@@ -1,0 +1,83 @@
+[project]
+name = "image2lego"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "AaryanMohanta", email = "aaryan.mohanta@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.141.1",
+    "matplotlib>=3.11.2",
+    "networkx>=3.6.1",
+    "numpy>=2.4.6",
+    "pillow>=12.3.0",
+    "python-multipart>=0.0.32",
+    "requests>=2.34.2",
+    "rich>=15.0.0",
+    "rtree>=1.4.1",
+    "scipy>=1.17.1",
+    "trimesh>=5.1.0",
+    "typer>=0.27.2",
+    "uvicorn[standard]>=0.53.0",
+]
+
+[project.scripts]
+image2lego = "image2lego.cli:main"
+
+[project.optional-dependencies]
+frontend = [
+    "rembg[cpu]>=2.0.84",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.10,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.13.0",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.7",
+    "scipy-stubs>=1.17.1.5",
+    "types-networkx>=3.6.1.20260911",
+    "types-requests>=2.33.0.20260906",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# typer's documented pattern is `= typer.Argument(...)` / `typer.Option(...)`
+# as parameter defaults; B008 otherwise assumes those are accidental mutable
+# defaults.
+"src/image2lego/cli.py" = ["B008"]
+# Same pattern, FastAPI's own idiom: `= File(...)` / `Form(...)`.
+"services/trellis2/app.py" = ["B008"]
+# Same idiom, plus an inline HTML/CSS/JS template whose line lengths are a
+# frontend concern, not a Python style one.
+"src/image2lego/web.py" = ["B008", "E501"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["image2lego"]
+strict = true
+
+# trimesh's type hints are incomplete (many methods untyped, some return Any),
+# so strict's disallow_untyped_calls/warn_return_any produce noise that isn't
+# actionable for code that's necessarily calling straight into trimesh/scipy.
+[[tool.mypy.overrides]]
+module = ["image2lego.geometry.*", "tests.test_mesh", "tests.test_voxelize", "tests.test_colorize"]
+disallow_untyped_calls = false
+warn_return_any = false
